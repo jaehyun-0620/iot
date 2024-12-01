@@ -1,0 +1,319 @@
+# client.py
+import socket
+import pickle
+from tqdm import tqdm
+import time
+import torch
+from torch.utils.data import Subset
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torchvision.transforms as transforms
+from torch.utils.data import Dataset
+from torch.autograd import Variable
+import struct
+from collections import OrderedDict
+import warnings
+import select
+
+warnings.filterwarnings("ignore")
+
+####################################################### 수정 가능 #######################################################
+# host = ''  # laptop ip 기입 (실제 연합학습 시 아래 loopback ip는 주석 처리)
+host = '127.0.0.1'  # loopback으로 연합학습 수행 시 사용될 ip
+port = 8080  # 1024번 ~ 65535번 사이에서 사용
+learning_rate = 0.001   # 사용자 편의에 맞게 조정
+batch_size = 32   # 사용자 편의에 맞게 조정
+epochs = 3   # 사용자 편의에 맞게 조정
+partition_id = 0   # jetson 1번은 partition_id = 0, jetson 2번은 partition_id = 1로 수정 후 실행
+
+# # Network도 사용자 편의에 맞게 조정 (client와 server의 network와 동일)
+# class Network(nn.Module):
+#     def __init__(self):
+#         super(Network, self).__init__()
+#
+#         self.conv1 = nn.Conv2d(in_channels=3, out_channels=12, kernel_size=5, stride=1, padding=2)
+#         self.bn1 = nn.BatchNorm2d(12)
+#         self.conv2 = nn.Conv2d(in_channels=12, out_channels=12, kernel_size=5, stride=1, padding=2)
+#         self.bn2 = nn.BatchNorm2d(12)
+#         self.pool = nn.MaxPool2d(2,2)
+#         self.conv4 = nn.Conv2d(in_channels=12, out_channels=24, kernel_size=5, stride=1, padding=2)
+#         self.bn4 = nn.BatchNorm2d(24)
+#         self.conv5 = nn.Conv2d(in_channels=24, out_channels=24, kernel_size=5, stride=1, padding=2)
+#         self.bn5 = nn.BatchNorm2d(24)
+#         self.fc1 = nn.Linear(24*16*16, 10)
+#
+#     def forward(self, input):
+#         output = F.relu(self.bn1(self.conv1(input))) #32 x 32 x3 -> 32 x 32 x 12
+#         output = F.relu(self.bn2(self.conv2(output)))
+#         output = self.pool(output)
+#         output = F.relu(self.bn4(self.conv4(output)))
+#         output = F.relu(self.bn5(self.conv5(output)))
+#         output = output.view(output.size(0),-1)
+#         output = self.fc1(output)
+#
+#         return output
+
+class MBConv(nn.Module):
+    def __init__(self, in_channels, out_channels, expand_ratio, stride, kernel_size, se_ratio=0.25):
+        super(MBConv, self).__init__()
+        self.expand_ratio = expand_ratio
+        hidden_dim = in_channels * expand_ratio
+        self.stride = stride
+
+        # 1x1 Expansion (if expand_ratio > 1)
+        self.expand = nn.Conv2d(in_channels, hidden_dim, kernel_size=1, stride=1, padding=0, bias=False) if expand_ratio > 1 else None
+        self.bn1 = nn.BatchNorm2d(hidden_dim)
+
+        # Depthwise Convolution
+        self.depthwise = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=kernel_size, stride=stride,
+                                   padding=kernel_size // 2, groups=hidden_dim, bias=False)
+        self.bn2 = nn.BatchNorm2d(hidden_dim)
+
+        # Squeeze-and-Excitation
+        self.se = SqueezeExcitation(hidden_dim, int(hidden_dim * se_ratio))
+
+        # 1x1 Projection
+        self.project = nn.Conv2d(hidden_dim, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+
+        self.use_residual = (stride == 1 and in_channels == out_channels)
+
+    def forward(self, x):
+        out = x
+        if self.expand:
+            out = F.relu6(self.bn1(self.expand(out)))
+        out = F.relu6(self.bn2(self.depthwise(out)))
+        out = self.se(out)
+        out = self.bn3(self.project(out))
+        if self.use_residual:
+            out += x
+        return out
+
+
+class SqueezeExcitation(nn.Module):
+    def __init__(self, in_channels, reduced_dim):
+        super(SqueezeExcitation, self).__init__()
+        self.fc1 = nn.Conv2d(in_channels, reduced_dim, kernel_size=1)
+        self.fc2 = nn.Conv2d(reduced_dim, in_channels, kernel_size=1)
+
+    def forward(self, x):
+        scale = torch.mean(x, dim=(2, 3), keepdim=True)
+        scale = F.relu(self.fc1(scale))
+        scale = torch.sigmoid(self.fc2(scale))
+        return x * scale
+
+class Network(nn.Module):
+    def __init__(self, num_classes=10):
+        super(Network, self).__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU6(inplace=True)
+        )
+
+        self.blocks = nn.Sequential(
+            # (in_channels, out_channels, expand_ratio, stride, kernel_size)
+            MBConv(32, 16, expand_ratio=1, stride=1, kernel_size=3),
+            MBConv(16, 24, expand_ratio=6, stride=2, kernel_size=3),
+            MBConv(24, 24, expand_ratio=6, stride=1, kernel_size=3),
+            MBConv(24, 40, expand_ratio=6, stride=2, kernel_size=5),
+            MBConv(40, 40, expand_ratio=6, stride=1, kernel_size=5),
+            MBConv(40, 80, expand_ratio=6, stride=2, kernel_size=3),
+            MBConv(80, 80, expand_ratio=6, stride=1, kernel_size=3),
+        )
+
+        self.head = nn.Sequential(
+            nn.Conv2d(80, 1280, kernel_size=1, bias=False),
+            nn.BatchNorm2d(1280),
+            nn.ReLU6(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(1280, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.blocks(x)
+        x = self.head(x)
+        return x
+
+
+
+train_transform = transforms.Compose([  # 사용자 편의에 맞게 조정
+                # Pytorch에서 제공하는 전처리 pipeline을 참고하여 사용자 본인이 작성
+                transforms.RandomResizedCrop(32),  # 랜덤한 크기로 잘라낸 후 224x224로 조정
+                transforms.RandomHorizontalFlip(p=0.5),  # 가로 방향 뒤집기
+                transforms.RandomRotation(10),  # 랜덤 회전
+                transforms.ToTensor(),  # 텐서로 변환
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])  # 정규화
+             ])
+test_transform = transforms.Compose([   # 사용자 편의에 맞게 조정
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+
+class CustomDataset(Dataset):   # 사용자 편의에 맞게 조정
+    def __init__(self, data, transform=None):
+        self.data = data
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        sample = self.data[idx]
+        image, label = sample["img"], sample["label"]
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
+
+def train(model, criterion, optimizer, train_loader, test_loader):   # pruning or quantization 적용시 필요한 경우 코드 추가 가능
+
+    best_accuracy = 0.0
+
+    model.to(device)
+
+    for epoch in range(epochs):
+        running_corrects = 0
+        running_loss = 0.0
+        total = 0
+
+        for i, (images, labels) in enumerate(tqdm(train_loader, desc="Train"), 0):
+            images = Variable(images.to(device))
+            labels = Variable(labels.to(device))
+
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+
+            _, preds = torch.max(outputs, 1)
+            running_corrects += torch.sum(preds == labels.data)
+            total += labels.size(0)
+
+        epoch_loss = running_loss / len(train_loader)
+        epoch_accuracy = running_corrects.double() / total
+
+        model.eval()
+        accuracy = 0.0
+        total = 0.0
+
+        with torch.no_grad():
+            for inputs, labels in tqdm(test_loader, desc="Test"):
+
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
+                predicted = torch.max(outputs.data, 1)[1]
+                total += labels.size(0)
+                accuracy += (predicted==labels).sum().item()
+        accuracy = (100 * accuracy / total)
+        print(f"Epoch [{epoch + 1}/{epochs}] => Train Loss: {epoch_loss:.4f} | Train Accuracy: {epoch_accuracy * 100:.2f}% | Test Accuracy: {accuracy:.2f}%")
+
+    return model
+
+##############################################################################################################################
+
+
+
+
+
+
+
+####################################################### 수정 금지 ##############################################################
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print("\nThe model will be running on", device, "device")
+
+def load_partition_data(alpha, partition_id, path_prefix="CIFAR10", transform=None):
+    print(f"Partition ID : {partition_id}")
+    if partition_id == 0:
+        file_path = f"./data/train_image/partition0/alpha_{alpha}_{path_prefix}_partition_{partition_id}.pt"
+    else:
+        file_path = f"./data/train_image/partition1/alpha_{alpha}_{path_prefix}_partition_{partition_id}.pt"
+
+    data = torch.load(file_path)
+    dataset = CustomDataset(data, transform=transform)
+
+    return dataset
+
+
+
+def main():
+    train_dataset = load_partition_data(alpha=1, partition_id=partition_id, path_prefix="CIFAR10", transform=train_transform)
+
+    test_dataset = torch.load('./data/test_image/test_dataset.pt')
+
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    ##############################################################################################################################
+    # Quantization or Pruning과 같은 경량화 기법 코드 추가 가능
+    model = Network()
+
+    # # 경량화 기법 적용 예시 (Pruning)
+    # def apply_pruning(model):
+    #     for module in model.modules():
+    #         if isinstance(module, nn.Conv2d):
+    #             torch.nn.utils.prune.l1_unstructured(module, name='weight', amount=0.2)
+    #
+    # # 원하는 경우 pruning 적용
+    # apply_pruning(model)
+
+    # Optimizer와 Criterion 수정 가능
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = torch.nn.CrossEntropyLoss()
+
+    ##############################################################################################################################
+
+
+
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.connect((host, port))
+
+    while True:
+        data_size = struct.unpack('>I', client.recv(4))[0]
+        rec_payload = b""
+
+        remaining_payload = data_size
+        while remaining_payload != 0:
+            rec_payload += client.recv(remaining_payload)
+            remaining_payload = data_size - len(rec_payload)
+        dict_weight = pickle.loads(rec_payload)
+        weight = OrderedDict(dict_weight)
+        print("\nReceived updated global model from server")
+
+        model.load_state_dict(weight, strict=True)
+
+        read_sockets, _, _ = select.select([client], [], [], 0)
+        if read_sockets:
+            print("Federated Learning finished")
+            break
+
+        model = train(model, criterion, optimizer, train_loader, test_loader)
+
+        model_data = pickle.dumps(dict(model.state_dict().items()))
+        client.sendall(struct.pack('>I', len(model_data)))
+        client.sendall(model_data)
+
+        print("Sent updated local model to server.")
+
+if __name__ == "__main__":
+    time.sleep(1)
+    main()
+
+##############################################################################################################################
+
+
+
+
+
+
+
+

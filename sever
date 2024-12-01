@@ -1,0 +1,293 @@
+# Laptop code
+import threading
+import socket
+import pickle
+import time
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Subset
+import torchvision.transforms as transforms
+import struct
+from tqdm import tqdm
+import copy
+import warnings
+import random
+
+warnings.filterwarnings("ignore")
+
+####################################################### 수정 가능 #######################################################
+target_accuracy = 80.0  # 사용자 편의에 맞게 조정
+global_round = 3   # 사용자 편의에 맞게 조정
+
+batch_size = 32  # 사용자 편의에 맞게 조정
+num_samples = 10000   # 사용자 편의에 맞게 조정
+# host = ''  # laptop ip 기입 (실제 연합학습 시 아래 loopback ip는 주석 처리)
+host = '127.0.0.1' # loopback으로 연합학습 수행 시 사용될 ip
+port = 8080 # 1024번 ~ 65535번
+
+test_transform = transforms.Compose([   # 사용자 편의에 맞게 조정
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+# # Network도 사용자 편의에 맞게 조정 (client와 server의 network와 동일)
+# class Network(nn.Module):
+#     def __init__(self):
+#         super(Network, self).__init__()
+#
+#         self.conv1 = nn.Conv2d(in_channels=3, out_channels=12, kernel_size=5, stride=1, padding=2)
+#         self.bn1 = nn.BatchNorm2d(12)
+#         self.conv2 = nn.Conv2d(in_channels=12, out_channels=12, kernel_size=5, stride=1, padding=2)
+#         self.bn2 = nn.BatchNorm2d(12)
+#         self.pool = nn.MaxPool2d(2,2)
+#         self.conv4 = nn.Conv2d(in_channels=12, out_channels=24, kernel_size=5, stride=1, padding=2)
+#         self.bn4 = nn.BatchNorm2d(24)
+#         self.conv5 = nn.Conv2d(in_channels=24, out_channels=24, kernel_size=5, stride=1, padding=2)
+#         self.bn5 = nn.BatchNorm2d(24)
+#         self.fc1 = nn.Linear(24*16*16, 10)
+#
+#     def forward(self, input):
+#         output = F.relu(self.bn1(self.conv1(input))) #32 x 32 x3 -> 32 x 32 x 12
+#         output = F.relu(self.bn2(self.conv2(output)))
+#         output = self.pool(output)
+#         output = F.relu(self.bn4(self.conv4(output)))
+#         output = F.relu(self.bn5(self.conv5(output)))
+#         output = output.view(output.size(0),-1)
+#         output = self.fc1(output)
+#
+#         return output
+
+class MBConv(nn.Module):
+    def __init__(self, in_channels, out_channels, expand_ratio, stride, kernel_size, se_ratio=0.25):
+        super(MBConv, self).__init__()
+        self.expand_ratio = expand_ratio
+        hidden_dim = in_channels * expand_ratio
+        self.stride = stride
+
+        # 1x1 Expansion (if expand_ratio > 1)
+        self.expand = nn.Conv2d(in_channels, hidden_dim, kernel_size=1, stride=1, padding=0, bias=False) if expand_ratio > 1 else None
+        self.bn1 = nn.BatchNorm2d(hidden_dim)
+
+        # Depthwise Convolution
+        self.depthwise = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=kernel_size, stride=stride,
+                                   padding=kernel_size // 2, groups=hidden_dim, bias=False)
+        self.bn2 = nn.BatchNorm2d(hidden_dim)
+
+        # Squeeze-and-Excitation
+        self.se = SqueezeExcitation(hidden_dim, int(hidden_dim * se_ratio))
+
+        # 1x1 Projection
+        self.project = nn.Conv2d(hidden_dim, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+
+        self.use_residual = (stride == 1 and in_channels == out_channels)
+
+    def forward(self, x):
+        out = x
+        if self.expand:
+            out = F.relu6(self.bn1(self.expand(out)))
+        out = F.relu6(self.bn2(self.depthwise(out)))
+        out = self.se(out)
+        out = self.bn3(self.project(out))
+        if self.use_residual:
+            out += x
+        return out
+
+
+class SqueezeExcitation(nn.Module):
+    def __init__(self, in_channels, reduced_dim):
+        super(SqueezeExcitation, self).__init__()
+        self.fc1 = nn.Conv2d(in_channels, reduced_dim, kernel_size=1)
+        self.fc2 = nn.Conv2d(reduced_dim, in_channels, kernel_size=1)
+
+    def forward(self, x):
+        scale = torch.mean(x, dim=(2, 3), keepdim=True)
+        scale = F.relu(self.fc1(scale))
+        scale = torch.sigmoid(self.fc2(scale))
+        return x * scale
+
+class Network(nn.Module):
+    def __init__(self, num_classes=10):
+        super(Network, self).__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU6(inplace=True)
+        )
+
+        self.blocks = nn.Sequential(
+            # (in_channels, out_channels, expand_ratio, stride, kernel_size)
+            MBConv(32, 16, expand_ratio=1, stride=1, kernel_size=3),
+            MBConv(16, 24, expand_ratio=6, stride=2, kernel_size=3),
+            MBConv(24, 24, expand_ratio=6, stride=1, kernel_size=3),
+            MBConv(24, 40, expand_ratio=6, stride=2, kernel_size=5),
+            MBConv(40, 40, expand_ratio=6, stride=1, kernel_size=5),
+            MBConv(40, 80, expand_ratio=6, stride=2, kernel_size=3),
+            MBConv(80, 80, expand_ratio=6, stride=1, kernel_size=3),
+        )
+
+        self.head = nn.Sequential(
+            nn.Conv2d(80, 1280, kernel_size=1, bias=False),
+            nn.BatchNorm2d(1280),
+            nn.ReLU6(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(1280, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.blocks(x)
+        x = self.head(x)
+        return x
+
+
+def measure_accuracy(global_model, test_loader):  # pruning or quantization 적용시 필요한 경우 코드 추가 가능
+    model = Network()
+    model.load_state_dict(global_model)
+    model.to(device)
+    model.eval()
+
+    accuracy = 0.0
+    total = 0.0
+
+    inference_start = time.time()
+    with torch.no_grad():
+        print("\n")
+        for inputs, labels in tqdm(test_loader, desc="Test"):
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+
+            predicted = torch.max(outputs, 1)[1]
+            total += labels.size(0)
+            accuracy += (predicted == labels).sum().item()
+
+        accuracy = (100 * accuracy / total)
+    inference_end = time.time()
+
+    print(f"Inference time for {num_samples} images : {(inference_end - inference_start):.2f} seconds")
+
+    return accuracy, model
+##############################################################################################################################
+
+
+
+
+
+
+####################################################### 수정 금지 ##############################################################
+cnt = []
+models = []  # 수신받은 model 저장할 리스트
+semaphore = threading.Semaphore(0)
+
+global_model = None
+global_accuracy = 0.0
+current_round = 0
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+def handle_client(conn, addr, model, test_loader):
+    global models, global_model, global_accuracy, current_round, cnt
+    print(f"Connected by {addr}")
+
+    while True:
+        if len(cnt) < 2:
+            cnt.append(1)
+            weight = pickle.dumps(dict(model.state_dict().items()))
+            conn.send(struct.pack('>I', len(weight)))
+            conn.send(weight)
+
+        data_size = struct.unpack('>I', conn.recv(4))[0]
+        received_payload = b""
+        remaining_payload_size = data_size
+        while remaining_payload_size != 0:
+            received_payload += conn.recv(remaining_payload_size)
+            remaining_payload_size = data_size - len(received_payload)
+        model = pickle.loads(received_payload)
+
+        models.append(model)
+
+        if len(models) == 2:
+            current_round += 1
+            global_model = average_models(models)
+            global_accuracy, global_model = measure_accuracy(global_model, test_loader)
+            print(f"Global round [{current_round} / {global_round}] Accuracy : {global_accuracy}%")
+            get_model_size(global_model)
+            models = []
+            semaphore.release()
+        else:
+            semaphore.acquire()
+
+        if (current_round == global_round) or (global_accuracy >= target_accuracy):
+            weight = pickle.dumps(dict(global_model.state_dict().items()))
+            conn.send(struct.pack('>I', len(weight)))
+            conn.send(weight)
+            conn.close()
+            break
+        else:
+            weight = pickle.dumps(dict(global_model.state_dict().items()))
+            conn.send(struct.pack('>I', len(weight)))
+            conn.send(weight)
+
+def get_model_size(global_model):
+    model_size = len(pickle.dumps(dict(global_model.state_dict().items())))
+    print(f"Model size : {model_size / (1024 ** 2):.4f} MB")
+
+def get_random_subset(dataset, num_samples):
+    if num_samples > len(dataset):
+        raise ValueError(f"num_samples should not exceed {len(dataset)} (total number of samples in test dataset).")
+
+    indices = random.sample(range(len(dataset)), num_samples)
+    subset = Subset(dataset, indices)
+    return subset
+
+def average_models(models):
+    weight_avg = copy.deepcopy(models[0])
+
+    for key in weight_avg.keys():
+        for i in range(1, len(models)):
+            weight_avg[key] += models[i][key]
+        weight_avg[key] = torch.div(weight_avg[key], len(models))
+
+    return weight_avg
+
+
+def main():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind((host, port))
+    server.listen()
+    connection = []
+    address = []
+
+    test_dataset = torch.load('./data/test_image/test_dataset.pt')
+
+    test_dataset = get_random_subset(test_dataset, num_samples)
+
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    print(f"Server is listening on {host}:{port}")
+    model = Network()
+
+    while len(address) < 2 and len(connection) < 2:
+        conn, addr = server.accept()
+        connection.append(conn)
+        address.append(addr)
+
+    training_start = time.time()
+
+    connection1 = threading.Thread(target=handle_client, args=(connection[0], address[0], model, test_loader))
+    connection2 = threading.Thread(target=handle_client, args=(connection[1], address[1], model, test_loader))
+
+    connection1.start();connection2.start()
+    connection1.join();connection2.join()
+
+    training_end = time.time()
+    total_time = training_end - training_start
+    print(f"\nTraining time: {int(total_time // 3600)} hours {int((total_time % 3600) // 60)} minutes {(total_time % 60):.2f} seconds")
+
+    print("Federated Learning finished")
+
+
+if __name__ == "__main__":
+    main()
+##############################################################################################################################
+
